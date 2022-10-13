@@ -1,4 +1,4 @@
-from sdf import SDF, TSDF
+from sdf import TSDF
 import pybullet as p
 import numpy as np
 import pybullet_data
@@ -28,7 +28,7 @@ def random_sphere_sampling(r, theta_min=0.0, theta_max=np.pi/3, phi_min=0.0, phi
     return transformation.astype(np.float32)
 
 
-mode = p.DIRECT  # p.DIRECT p.GUI
+mode = p.GUI  # p.DIRECT p.GUI
 physics = p.connect(mode)
 p.setGravity(0, 0, -9.8)
 p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -50,8 +50,8 @@ r = 0.5  # meter
 half_range = 0.2
 volume_bounds = np.array([[-half_range, half_range],
                           [-half_range, half_range],
-                          [-half_range/7, half_range]])
-resolution = 0.002
+                          [-half_range, half_range]])
+resolution = np.array([200, 200, 200])
 
 half_size = 0.05
 box1 = p.createMultiBody(0,
@@ -66,10 +66,12 @@ sphere = p.createMultiBody(0,
                            p.createCollisionShape(p.GEOM_SPHERE, radius=half_size),
                            p.createVisualShape(p.GEOM_SPHERE, radius=half_size),
                            basePosition=[0, half_size*2, half_size])
+p.changeVisualShape(box1, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
+p.changeVisualShape(box2, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
+p.changeVisualShape(sphere, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
 p.stepSimulation()
 
-tsdf = TSDF(volume_bounds, resolution, rgb=False)
-# sdf = SDF(volume_bounds, resolution, rgb=False)
+tsdf = TSDF(volume_bounds.T[0], resolution, 0.002, fuse_color=True)
 total = 0
 for i in range(num_fusion):
     t_c2w = random_sphere_sampling(r)
@@ -87,16 +89,14 @@ for i in range(num_fusion):
     depth = far * near / (far - (far - near) * depth)
     depth = depth.astype(np.float32)
     b = time.time()
-    tsdf.tsdf_integrate(depth, intrinsic, t_c2w, rgb=color)
+    tsdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
     e = time.time()
     total += e - b
     print('{} frame(s) processed'.format(i))
     # sdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
 print('fps: {}'.format(num_fusion / total))
-tsdf.post_process_volume()
-tsdf.write_pcl('tsdf_cube_pcl.ply', tsdf.compute_pcl(threshold=0.2))
-tsdf.write_pcl('tsdf_cube_pcl_gradients.ply', tsdf.compute_pcl_using_gradients(threshold=0.4))
-tsdf.write_mesh('tsdf_cube_mesh.ply', *tsdf.compute_mesh())
+tsdf.write_pcl('tsdf_cube_pcl.ply', *tsdf.compute_pcl(threshold=0.2))
+tsdf.write_mesh('tsdf_cube_mesh.ply', *tsdf.marching_cubes())
 # tsdf.write_mesh('tsdf_cube_mesh_propagation.ply', *tsdf.normal_propagation())
 # sdf.write_pcl('sdf_cube_pcl.ply', sdf.compute_pcl(threshold=0.2))
 # sdf.write_mesh('sdf_cube_mesh.ply', *sdf.compute_mesh())
