@@ -78,7 +78,6 @@ class TSDF(object):
         w_new = w_old + weight
         sdf_new = (w_old * sdf_old + weight * valid_dist) / w_new
         self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = sdf_new
-        self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
         if self.fuse_color and rgb is not None:
             rgb = self.to_tensor(rgb)
             rgb_old = self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
@@ -86,6 +85,8 @@ class TSDF(object):
             valid_rgb = rgb[valid_pts]
             rgb_new = (w_old[:, None] * rgb_old + weight * valid_rgb) / w_new[:, None]
             self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2], :] = rgb_new
+        w_new = torch.clamp(w_new, max=20)
+        self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
 
     def reset(self):
         self.sdf_vol = torch.ones(*self.res).to(self.dt).to(self.dev)
@@ -121,6 +122,7 @@ class TSDF(object):
         else:
             rgb = torch.ones_like(xyz) * 255
         e = time.time()
+        print('elapse time on extracting point cloud: {:04f}ms'.format((e - b) * 1000))
         return xyz, rgb.to(torch.uint8)
 
     def sdf_info(self):
@@ -136,6 +138,64 @@ class TSDF(object):
         print('z_min: {:04f}m'.format(self.origin[2]))
         print('z_max: {:04f}m'.format(self.origin[2]+self.res[2]*self.vox_len))
         print('voxel length: {:06f}m'.format(self.vox_len))
+
+    def depth2cloud(self, depth, intrinsic):
+        h, w = depth.shape
+        xm, ym = torch.meshgrid(torch.arange(w), torch.arange(h), indexing='xy')
+        pixel_coords = torch.stack([xm, ym, torch.ones_like(xm)], dim=-1).to(self.dt).to(self.dev)  # H x W x 3
+        inv_intrinsic = torch.linalg.inv(intrinsic)
+        pcl = depth.unsqueeze(dim=-1) * (pixel_coords @ inv_intrinsic.T)  # ordered point cloud map
+        return pcl
+
+    def normal_estimation(self, depth, intrinsic, kernel=5, normalized=True):
+        """
+        Estimate surface normals in camera frame given the depth map and the intrinsic matrix of the camera.
+        We estimate the surface normal by approximating the surface z = f(x, y) as a linear function of x and y.
+        For more details, please refer to "A Fast Method For Computing Principal Curvatures From Range Images".
+        :param depth: (torch.Tensor) [H, W] the depth map.
+        :param intrinsic: (torch.Tensor) [3, 3] the intrinsic matrix of the camera.
+        :param kernel: (int) the size of the kernel that containing the pixels used to estimate surface normal.
+        :param normalized: (bool) whether normalize the surface normal or not.
+        :return: (torch.Tensor) [H, W, 3] the surface normal map in camera frame.
+        """
+        assert kernel % 2 == 1  # make sure the patch_size is odd.
+        pixel_coords = self.depth2cloud(depth, intrinsic)
+        # duplicate coordinates according to the offsets
+        h, w = pixel_coords.shape[0:2]
+        shift_ids = torch.cat(
+            [ids.reshape(-1, 1) for ids in torch.meshgrid(torch.arange(kernel), torch.arange(kernel), indexing='ij')],
+            dim=1) - kernel // 2
+        num_shift = shift_ids.shape[0]
+        pixel_pos_combined = torch.zeros_like(pixel_coords, dtype=self.dt, device=self.dev)
+        pixel_pos_combined = torch.stack([pixel_pos_combined] * num_shift, dim=2)
+        num_valid = torch.zeros((h, w), dtype=self.dt, device=self.dev)  # # of non-zero pixels in a kernel
+        for i in range(num_shift):
+            h0c, w0c = max(0, 0 + shift_ids[i][0]), max(0, 0 + shift_ids[i][1])
+            h1c, w1c = min(h, h + shift_ids[i][0]), min(w, w + shift_ids[i][1])
+            h0a, w0a = max(0, 0 - shift_ids[i][0]), max(0, 0 - shift_ids[i][1])
+            h1a, w1a = min(h, h - shift_ids[i][0]), min(w, w - shift_ids[i][1])
+            pixel_pos_combined[h0c:h1c, w0c:w1c, i] = pixel_coords[h0a:h1a, w0a:w1a]
+            num_valid[h0c:h1c, w0c:w1c] += 1
+        zero_flag = pixel_pos_combined[..., 0] == 0  # # H x W x num_shift
+        num_valid = num_valid.unsqueeze(dim=-1).unsqueeze(dim=-1)  # H x W x 1 x 1
+        mean = torch.sum(pixel_pos_combined / num_valid, dim=2, keepdim=True)  # H x W x 1 x 3
+        pixel_pos_combined[zero_flag] = (torch.ones_like(pixel_pos_combined, device=self.dev, dtype=self.dt) * mean)[zero_flag]
+        pos_cen = pixel_pos_combined - mean
+        x_cen, y_cen, z_cen = pos_cen.unbind(dim=-1)
+        m00 = torch.sum(x_cen * x_cen, dim=-1)
+        m01 = torch.sum(x_cen * y_cen, dim=-1)
+        m10 = m01
+        m11 = torch.sum(y_cen * y_cen, dim=-1)
+        v0 = torch.sum(x_cen * z_cen, dim=-1)
+        v1 = torch.sum(y_cen * z_cen, dim=-1)
+        det = m00 * m11 - m01 * m10
+        a, b = (m11 * v0 - m01 * v1) / det, (-m10 * v0 + m00 * v1) / det
+        if normalized:
+            norm = torch.sqrt(1 + a * a + b * b)
+            n = torch.stack([a / norm, b / norm, -1 / norm], dim=-1)
+        else:
+            n = torch.stack([a, b, -torch.ones_like(a, device=self.dev, dtype=self.dt)], dim=-1)
+        return n
 
     @staticmethod
     def write_mesh(filename, vertices, faces, normals, rgbs):
@@ -171,16 +231,18 @@ class TSDF(object):
         ply_file.close()
 
     @staticmethod
-    def write_pcl(filename, xyz, rgb):
+    def write_pcl(filename, xyz, rgb, n=None):
         """
         Save a point cloud to a polygon .ply file.
         :param filename: The file name of the.ply file.
         :param xyz: (torch.Tensor.float) [N, 3] the point cloud
         :param rgb: (torch.Tensor.uint8) [N, 3] the corresponding rgb values of the point cloud
+        :param n: (torch.Tensor.float) [N, 3] optional, the corresponding vertex normals
         :return: None
         """
         xyz = xyz.cpu().numpy()
         rgb = rgb.cpu().numpy()
+        n = n.cpu().numpy() if n is not None else None
         # Write header
         ply_file = open(filename, 'w')
         ply_file.write("ply\n")
@@ -189,12 +251,164 @@ class TSDF(object):
         ply_file.write("property float x\n")
         ply_file.write("property float y\n")
         ply_file.write("property float z\n")
+        if n is not None:
+            ply_file.write("property float nx\n")
+            ply_file.write("property float ny\n")
+            ply_file.write("property float nz\n")
         ply_file.write("property uchar red\n")
         ply_file.write("property uchar green\n")
         ply_file.write("property uchar blue\n")
         ply_file.write("end_header\n")
         # Write vertex list
-        for i in range(xyz.shape[0]):
-            ply_file.write("%f %f %f %d %d %d\n" % (
-                xyz[i, 0], xyz[i, 1], xyz[i, 2],
-                rgb[i, 0], rgb[i, 1], rgb[i, 2],))
+        if n is None:
+            for i in range(xyz.shape[0]):
+                ply_file.write("%f %f %f %d %d %d\n" % (
+                    xyz[i, 0], xyz[i, 1], xyz[i, 2],
+                    rgb[i, 0], rgb[i, 1], rgb[i, 2],))
+        else:
+            for i in range(xyz.shape[0]):
+                ply_file.write("%f %f %f %f %f %f %d %d %d\n" % (
+                    xyz[i, 0], xyz[i, 1], xyz[i, 2],
+                    n[i, 0], n[i, 1], n[i, 2],
+                    rgb[i, 0], rgb[i, 1], rgb[i, 2],))
+
+
+class PSDF(TSDF):
+    def __init__(self, origin, resolution, voxel_length, truncated_length=0.005,
+                 fuse_color=False, device='cuda', dtype=torch.float):
+        super().__init__(origin, resolution, voxel_length, truncated_length, fuse_color, device, dtype)
+        self.w_vol = torch.ones(*self.res).to(self.dt).to(self.dev) * 10  # sigma2 volume
+
+    def reset(self):
+        super().reset()
+        self.w_vol = torch.ones(*self.res).to(self.dt).to(self.dev) * 10
+
+    def psdf_integrate(self, depth, intrinsic, camera_pose, rgb=None):
+        """
+        Integrate RGB-D frame into SDF volume (naive SDF)
+        :param depth: (ndarray.float) [H, W] a depth map whose unit is meter.
+        :param intrinsic: (ndarray.float) [3, 3] the camera intrinsic matrix
+        :param camera_pose: (ndarray.float) [4, 4] the transformation from world to camera frame
+        :param rgb: (ndarray.uint8) [H, W, 3] a color image
+        :return: None
+        """
+        depth = self.to_tensor(depth)
+        cam_intr = self.to_tensor(intrinsic)
+        n = self.normal_estimation(depth, cam_intr)
+        fx, fy, cx, cy = cam_intr[0, 0], cam_intr[1, 1], cam_intr[0, 2], cam_intr[1, 2]
+        cam_pose = self.to_tensor(camera_pose)  # w2c
+        im_h, im_w = depth.shape
+        c2w = torch.inverse(cam_pose)
+        cam_coords = self.world_coords @ c2w.T  # world coordinates represented in camera frame
+        pix_z = cam_coords[..., 2]
+        # project all the voxels back to image plane
+        pix_x = torch.round((cam_coords[..., 0] * fx / cam_coords[..., 2]) + cx).long()
+        pix_y = torch.round((cam_coords[..., 1] * fy / cam_coords[..., 2]) + cy).long()
+        # eliminate pixels outside view frustum
+        valid_pix = (pix_x >= 0) & (pix_x < im_w) & (pix_y >= 0) & (pix_y < im_h) & (pix_z > 0)
+        valid_vox_coords = self.vox_coords[valid_pix]
+        depth_val = depth[pix_y[valid_pix], pix_x[valid_pix]]
+        # integrate sdf
+        depth_diff = depth_val - pix_z[valid_pix]
+        # all points 1. inside frustum 2. with valid depth 3. outside -truncate_dist
+        dist = torch.clamp(depth_diff / self.sdf_trunc, max=1)
+        valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
+        valid_vox_coords = valid_vox_coords[valid_pts]
+        valid_dist = dist[valid_pts]
+        valid_depth_val = depth_val[valid_pts]
+        n = n[pix_y[valid_pix], pix_x[valid_pix]]
+        valid_n = n[valid_pts]
+        valid_cos_theta = torch.acos(torch.abs(valid_n[:, 2]))
+        sigma = 0.0012 + 0.0019 * (valid_depth_val - 0.4) ** 2 + 0.0001 / torch.sqrt(valid_depth_val) * valid_cos_theta ** 2 / (torch.pi / 2 - valid_cos_theta) ** 2
+        sigma2 = (sigma / self.sdf_trunc) ** 2  # + (torch.exp(0.3 * torch.abs(valid_dist)) - 1)
+        sigma2_old = self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        sdf_old = self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        sigma2_sum = sigma2_old + sigma2
+        sdf_new = (sigma2_old * valid_dist + sigma2 * sdf_old) / sigma2_sum
+        self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = sdf_new
+        if self.fuse_color and rgb is not None:
+            rgb = self.to_tensor(rgb)
+            rgb_old = self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+            rgb = rgb[pix_y[valid_pix], pix_x[valid_pix]]
+            valid_rgb = rgb[valid_pts]
+            rgb_new = (sigma2_old[:, None] * valid_rgb + sigma2[:, None] * rgb_old) / sigma2_sum[:, None]
+            self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2], :] = rgb_new
+        self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = (sigma2_old * sigma2) / sigma2_sum
+
+
+class GradientSDF(TSDF):
+    def __init__(self, origin, resolution, voxel_length, truncated_length=0.005,
+                 fuse_color=False, device='cuda', dtype=torch.float):
+        super().__init__(origin, resolution, voxel_length, truncated_length, fuse_color, device, dtype)
+        self.grad_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)  # scaled gradient
+
+    def reset(self):
+        super().reset()
+        self.grad_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)
+
+    def gsdf_integrate(self, depth, intrinsic, camera_pose, weight=1.0, rgb=None):
+        """
+        Integrate RGB-D frame into SDF volume (naive SDF)
+        :param depth: (ndarray.float) [H, W] a depth map whose unit is meter.
+        :param intrinsic: (ndarray.float) [3, 3] the camera intrinsic matrix
+        :param camera_pose: (ndarray.float) [4, 4] the transformation from world to camera frame
+        :param weight: (float) the fusing weight for current observation
+        :param rgb: (ndarray.uint8) [H, W, 3] a color image
+        :return: None
+        """
+        depth = self.to_tensor(depth)
+        cam_intr = self.to_tensor(intrinsic)
+        n = self.normal_estimation(depth, cam_intr)
+        fx, fy, cx, cy = cam_intr[0, 0], cam_intr[1, 1], cam_intr[0, 2], cam_intr[1, 2]
+        cam_pose = self.to_tensor(camera_pose)  # w2c
+        im_h, im_w = depth.shape
+        c2w = torch.inverse(cam_pose)
+        cam_coords = self.world_coords @ c2w.T  # world coordinates represented in camera frame
+        pix_z = cam_coords[..., 2]
+        # project all the voxels back to image plane
+        pix_x = torch.round((cam_coords[..., 0] * fx / cam_coords[..., 2]) + cx).long()
+        pix_y = torch.round((cam_coords[..., 1] * fy / cam_coords[..., 2]) + cy).long()
+        # eliminate pixels outside view frustum
+        valid_pix = (pix_x >= 0) & (pix_x < im_w) & (pix_y >= 0) & (pix_y < im_h) & (pix_z > 0)
+        valid_vox_coords = self.vox_coords[valid_pix]
+        depth_val = depth[pix_y[valid_pix], pix_x[valid_pix]]
+        # integrate sdf
+        depth_diff = depth_val - pix_z[valid_pix]
+        # all points 1. inside frustum 2. with valid depth 3. outside -truncate_dist
+        dist = torch.clamp(depth_diff / self.sdf_trunc, max=1)
+        valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
+        valid_vox_coords = valid_vox_coords[valid_pts]
+        valid_dist = dist[valid_pts]
+        w_old = self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        sdf_old = self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        w_new = w_old + weight
+        sdf_new = (w_old * sdf_old + weight * valid_dist) / w_new
+        self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = sdf_new
+        g_old = self.grad_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        valid_n_c = n[pix_y[valid_pix], pix_x[valid_pix]][valid_pts]
+        valid_n_w = valid_n_c @ cam_pose[0:3, 0:3].T
+        g_new = (w_old[:, None] * g_old + weight * valid_n_w) / w_new[:, None]
+        self.grad_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2], :] = g_new
+        if self.fuse_color and rgb is not None:
+            rgb = self.to_tensor(rgb)
+            rgb_old = self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+            rgb = rgb[pix_y[valid_pix], pix_x[valid_pix]]
+            valid_rgb = rgb[valid_pts]
+            rgb_new = (w_old[:, None] * rgb_old + weight * valid_rgb) / w_new[:, None]
+            self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2], :] = rgb_new
+        # w_new = torch.clamp(w_new, max=20)
+        self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
+
+    def compute_pcl(self, threshold=0.2):
+        b = time.time()
+        valid_vox = torch.abs(self.sdf_vol) < threshold
+        xyz = self.vox_coords[valid_vox] * self.vox_len + self.origin.reshape(1, 3)
+        if self.fuse_color:
+            rgb = self.rgb_vol[valid_vox]
+        else:
+            rgb = torch.ones_like(xyz) * 255
+        g = self.grad_vol[valid_vox]
+        n = g / torch.linalg.norm(g, dim=1, keepdim=True)
+        e = time.time()
+        print('elapse time on extracting point cloud: {:04f}ms'.format((e - b) * 1000))
+        return xyz, rgb.to(torch.uint8), n

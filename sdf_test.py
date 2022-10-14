@@ -1,10 +1,12 @@
-from sdf import TSDF
+from sdf import TSDF, PSDF, GradientSDF
 import pybullet as p
 import numpy as np
 import pybullet_data
 import torch
 import time
 torch.set_default_dtype(torch.float32)
+torch.manual_seed(777)
+np.random.seed(777)
 
 
 def random_sphere_sampling(r, theta_min=0.0, theta_max=np.pi/3, phi_min=0.0, phi_max=np.pi*2):
@@ -71,7 +73,7 @@ p.changeVisualShape(box2, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
 p.changeVisualShape(sphere, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
 p.stepSimulation()
 
-tsdf = TSDF(volume_bounds.T[0], resolution, 0.002, fuse_color=True)
+sdf = GradientSDF(volume_bounds.T[0], resolution, 0.002, fuse_color=True)
 total = 0
 for i in range(num_fusion):
     t_c2w = random_sphere_sampling(r)
@@ -89,17 +91,14 @@ for i in range(num_fusion):
     depth = far * near / (far - (far - near) * depth)
     depth = depth.astype(np.float32)
     b = time.time()
-    tsdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
+    sdf.gsdf_integrate(depth, intrinsic, t_c2w, rgb=color)
     e = time.time()
     total += e - b
     print('{} frame(s) processed'.format(i))
     # sdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
 print('fps: {}'.format(num_fusion / total))
-tsdf.write_pcl('tsdf_cube_pcl.ply', *tsdf.compute_pcl(threshold=0.2))
-tsdf.write_mesh('tsdf_cube_mesh.ply', *tsdf.marching_cubes())
-# tsdf.write_mesh('tsdf_cube_mesh_propagation.ply', *tsdf.normal_propagation())
-# sdf.write_pcl('sdf_cube_pcl.ply', sdf.compute_pcl(threshold=0.2))
-# sdf.write_mesh('sdf_cube_mesh.ply', *sdf.compute_mesh())
+sdf.write_pcl('tsdf_cube_pcl.ply', *sdf.compute_pcl(threshold=0.2))
+sdf.write_mesh('tsdf_cube_mesh.ply', *sdf.marching_cubes())
 
 
 
