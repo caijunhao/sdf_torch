@@ -41,13 +41,13 @@ class TSDF(object):
                                       dim=-1)
         self.sdf_info()
 
-    def sdf_integrate(self, depth, intrinsic, camera_pose, weight=1.0, rgb=None):
+    def integrate(self, depth, intrinsic, camera_pose, dist_func='point2point', rgb=None):
         """
         Integrate RGB-D frame into SDF volume (naive SDF)
         :param depth: (ndarray.float) [H, W] a depth map whose unit is meter.
         :param intrinsic: (ndarray.float) [3, 3] the camera intrinsic matrix
         :param camera_pose: (ndarray.float) [4, 4] the transformation from world to camera frame
-        :param weight: (float) the fusing weight for current observation
+        :param dist_func: (str) point2point or point2plane
         :param rgb: (ndarray.uint8) [H, W, 3] a color image
         :return: None
         """
@@ -73,8 +73,17 @@ class TSDF(object):
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
+        assert dist_func in ['point2point', 'point2plane']
+        if dist_func == 'point2plane':
+            n = self.normal_estimation(depth, cam_intr)
+            valid_cam_coords = cam_coords[..., 0:3][valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+            rays = valid_cam_coords / torch.linalg.norm(valid_cam_coords, dim=1, keepdim=True)
+            valid_n = n[pix_y[valid_pix], pix_x[valid_pix]][valid_pts]
+            cos = torch.abs(torch.sum(rays * valid_n, dim=1))
+            valid_dist = valid_dist * cos
         w_old = self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
         sdf_old = self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        weight = 1.0
         w_new = w_old + weight
         sdf_new = (w_old * sdf_old + weight * valid_dist) / w_new
         self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = sdf_new
@@ -283,12 +292,13 @@ class PSDF(TSDF):
         super().reset()
         self.w_vol = torch.ones(*self.res).to(self.dt).to(self.dev) * 10
 
-    def psdf_integrate(self, depth, intrinsic, camera_pose, rgb=None):
+    def integrate(self, depth, intrinsic, camera_pose, dist_func='point2point', rgb=None):
         """
         Integrate RGB-D frame into SDF volume (naive SDF)
         :param depth: (ndarray.float) [H, W] a depth map whose unit is meter.
         :param intrinsic: (ndarray.float) [3, 3] the camera intrinsic matrix
         :param camera_pose: (ndarray.float) [4, 4] the transformation from world to camera frame
+        :param dist_func: (str) point2point or point2plane
         :param rgb: (ndarray.uint8) [H, W, 3] a color image
         :return: None
         """
@@ -315,6 +325,13 @@ class PSDF(TSDF):
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
+        assert dist_func in ['point2point', 'point2plane']
+        if dist_func == 'point2plane':
+            valid_cam_coords = cam_coords[..., 0:3][valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+            rays = valid_cam_coords / torch.linalg.norm(valid_cam_coords, dim=1, keepdim=True)
+            valid_n = n[pix_y[valid_pix], pix_x[valid_pix]][valid_pts]
+            cos = torch.abs(torch.sum(rays * valid_n, dim=1))
+            valid_dist = valid_dist * cos
         valid_depth_val = depth_val[valid_pts]
         n = n[pix_y[valid_pix], pix_x[valid_pix]]
         valid_n = n[valid_pts]
@@ -346,13 +363,13 @@ class GradientSDF(TSDF):
         super().reset()
         self.grad_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)
 
-    def gsdf_integrate(self, depth, intrinsic, camera_pose, weight=1.0, rgb=None):
+    def integrate(self, depth, intrinsic, camera_pose, dist_func='point2point', rgb=None):
         """
         Integrate RGB-D frame into SDF volume (naive SDF)
         :param depth: (ndarray.float) [H, W] a depth map whose unit is meter.
         :param intrinsic: (ndarray.float) [3, 3] the camera intrinsic matrix
         :param camera_pose: (ndarray.float) [4, 4] the transformation from world to camera frame
-        :param weight: (float) the fusing weight for current observation
+        :param dist_func: (str) point2point or point2plane
         :param rgb: (ndarray.uint8) [H, W, 3] a color image
         :return: None
         """
@@ -379,8 +396,16 @@ class GradientSDF(TSDF):
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
+        assert dist_func in ['point2point', 'point2plane']
+        if dist_func == 'point2plane':
+            valid_cam_coords = cam_coords[..., 0:3][valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+            rays = valid_cam_coords / torch.linalg.norm(valid_cam_coords, dim=1, keepdim=True)
+            valid_n = n[pix_y[valid_pix], pix_x[valid_pix]][valid_pts]
+            cos = torch.abs(torch.sum(rays * valid_n, dim=1))
+            valid_dist = valid_dist * cos
         w_old = self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
         sdf_old = self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
+        weight = 1.0
         w_new = w_old + weight
         sdf_new = (w_old * sdf_old + weight * valid_dist) / w_new
         self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = sdf_new

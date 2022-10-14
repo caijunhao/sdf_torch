@@ -47,7 +47,7 @@ fov = (height / 2) / focal_len
 fov = np.arctan(fov) * 2 / np.pi * 180
 project_matrix = p.computeProjectionMatrixFOV(fov, aspect_ratio, near, far)
 
-num_fusion = 50
+num_fusion = 20
 r = 0.5  # meter
 half_range = 0.2
 volume_bounds = np.array([[-half_range, half_range],
@@ -91,7 +91,7 @@ for i in range(num_fusion):
     depth = far * near / (far - (far - near) * depth)
     depth = depth.astype(np.float32)
     b = time.time()
-    sdf.gsdf_integrate(depth, intrinsic, t_c2w, rgb=color)
+    sdf.integrate(depth, intrinsic, t_c2w, dist_func='point2plane', rgb=color)
     e = time.time()
     total += e - b
     print('{} frame(s) processed'.format(i))
