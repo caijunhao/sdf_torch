@@ -122,7 +122,7 @@ class TSDF(object):
             data = torch.from_numpy(data)
         return data.to(self.dt).to(self.dev)
 
-    def marching_cubes(self, step_size=1, use_post_processed=True, smooth=True):
+    def marching_cubes(self, step_size=1, level=0, use_post_processed=True, smooth=True):
         b = time.time()
         if use_post_processed:
             sdf_vol = self.post_processed_vol
@@ -131,7 +131,7 @@ class TSDF(object):
         if smooth:
             sdf_vol = self.gaussian_smooth(sdf_vol)
         sdf_vol = sdf_vol.cpu().numpy()
-        verts, faces, norms, vals = measure.marching_cubes(sdf_vol, step_size=step_size)
+        verts, faces, norms, vals = measure.marching_cubes(sdf_vol, level=level, step_size=step_size)
         norms = -norms
         verts_ids = np.round(verts).astype(int)
         verts = verts * self.vox_len.cpu().numpy() + self.origin.cpu().numpy().reshape(1, 3)
