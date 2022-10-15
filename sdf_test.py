@@ -1,4 +1,5 @@
 from sdf import TSDF, PSDF, GradientSDF
+from matplotlib.cm import get_cmap
 import pybullet as p
 import numpy as np
 import pybullet_data
@@ -7,6 +8,12 @@ import time
 torch.set_default_dtype(torch.float32)
 torch.manual_seed(777)
 np.random.seed(777)
+
+
+def colormap(val):
+    cmap = get_cmap('Spectral')
+    rgba = cmap(1-val)
+    return (rgba[:, 0:3] * 255).astype(np.uint8)
 
 
 def random_sphere_sampling(r, theta_min=0.0, theta_max=np.pi/3, phi_min=0.0, phi_max=np.pi*2):
@@ -47,15 +54,15 @@ fov = (height / 2) / focal_len
 fov = np.arctan(fov) * 2 / np.pi * 180
 project_matrix = p.computeProjectionMatrixFOV(fov, aspect_ratio, near, far)
 
-num_fusion = 20
+num_fusion = 100
 r = 0.5  # meter
 half_range = 0.2
-origin = np.array([-0.192, -0.192, 0.007])
+origin = np.array([-0.2, -0.2, 0.000])
 volume_bounds = np.array([[-half_range, half_range],
                           [-half_range, half_range],
                           [-half_range, half_range]])
-resolution = np.array([128, 128, 96])
-voxel_length = 0.003
+resolution = np.array([200, 200, 100])
+voxel_length = 0.002
 
 half_size = 0.05
 box1 = p.createMultiBody(0,
@@ -93,14 +100,17 @@ for i in range(num_fusion):
     depth = far * near / (far - (far - near) * depth)
     depth = depth.astype(np.float32)
     b = time.time()
-    sdf.integrate(depth, intrinsic, t_c2w, dist_func='point2plane', rgb=color)
+    sdf.integrate(depth, intrinsic, t_c2w, dist_func='point2point', rgb=color)
     e = time.time()
     total += e - b
     print('{} frame(s) processed'.format(i))
     # sdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
 print('fps: {}'.format(num_fusion / total))
 sdf.write_pcl('tsdf_cube_pcl.ply', *sdf.compute_pcl(threshold=0.2))
-sdf.write_mesh('tsdf_cube_mesh.ply', *sdf.marching_cubes(smooth=False))
+verts, faces, norms, rgbs = sdf.marching_cubes(smooth=False)
+sigma2 = sdf.interpolation(verts, sdf=False, weight=True)
+rgbs = colormap(np.tanh(0.5 * sigma2.cpu().numpy()))
+sdf.write_mesh('tsdf_cube_mesh.ply', verts, faces, norms, rgbs)
 
 
 

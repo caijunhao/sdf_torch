@@ -29,6 +29,7 @@ class TSDF(object):
         # Initialize volumes
         self.sdf_vol = torch.ones(*self.res).to(self.dt).to(self.dev)
         self.w_vol = torch.zeros(*self.res).to(self.dt).to(self.dev)
+        self.grad_vol = None
         self.aux_vol = torch.zeros(*self.res).to(torch.bool).to(self.dev)
         if self.fuse_color:
             self.rgb_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)
@@ -244,6 +245,48 @@ class TSDF(object):
         volume = conv3d(volume, weight=kernel, stride=1, padding=h)
         volume = torch.squeeze(volume)
         return volume
+
+    def interpolation(self, coords,
+                      sdf=True, rgb=False, weight=False, grad=False,
+                      use_post_processed=True, smooth=True,
+                      mode='bilinear', padding_mode='border'):
+        ids = self.get_ids(coords)
+        ids = ids.unsqueeze(dim=1).unsqueeze(dim=1).unsqueeze(dim=0)  # B*N*1*1*3
+        ids = torch.stack([ids[..., 2], ids[..., 1], ids[..., 0]], dim=-1)
+        h, w, d = self.res
+        size = torch.tensor([d - 1, w - 1, h - 1]).to(self.dt).to(self.dev).reshape((1, 1, 1, 1, 3))
+        grid = ids / size * 2 - 1  # [-1, 1]
+        out = []
+        if sdf:
+            sdf_vol = self.post_processed_vol if use_post_processed else self.sdf_vol
+            if smooth:
+                sdf_vol = self.gaussian_smooth(sdf_vol)
+            sdf_vol = sdf_vol.view(1, 1, h, w, d)
+            out.append(grid_sample(sdf_vol, grid, mode=mode, padding_mode=padding_mode, align_corners=True).squeeze())
+        if rgb:
+            rgb_vol = self.rgb_vol.permute(3, 0, 1, 2).unsqueeze(dim=0)
+            out.append(grid_sample(rgb_vol, grid, mode='nearest', padding_mode=padding_mode, align_corners=True).squeeze())
+        if weight:
+            w_vol = self.w_vol.view(1, 1, h, w, d)
+            out.append(grid_sample(w_vol, grid, mode=mode, padding_mode=padding_mode, align_corners=True).squeeze())
+        if grad and self.grad_vol is not None:
+            grad_vol = self.grad_vol.permute(3, 0, 1, 2).unsqueeze(dim=0)
+            out.append(grid_sample(grad_vol, grid, mode='nearest', padding_mode=padding_mode, align_corners=True).squeeze())
+        return out if len(out) > 1 else out[0]
+
+    def get_ids(self, coords):
+        if isinstance(coords, np.ndarray):
+            coords = torch.from_numpy(coords)
+        coords = coords.to(self.dt).to(self.dev)
+        ids = (coords - self.origin.view(1, 3)) / self.vox_len
+        return ids
+
+    def get_coords(self, ids):
+        if isinstance(ids, np.ndarray):
+            ids = torch.from_numpy(ids)
+        ids = ids.to(self.dt).to(self.dev)
+        coords = ids * self.vox_len + self.origin.view(1, 3)
+        return coords
 
     @staticmethod
     def write_mesh(filename, vertices, faces, normals, rgbs):
