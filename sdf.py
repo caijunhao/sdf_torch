@@ -1,4 +1,5 @@
 from skimage import measure
+from torch.nn.functional import conv3d, grid_sample
 import numpy as np
 import torch
 import time
@@ -28,6 +29,7 @@ class TSDF(object):
         # Initialize volumes
         self.sdf_vol = torch.ones(*self.res).to(self.dt).to(self.dev)
         self.w_vol = torch.zeros(*self.res).to(self.dt).to(self.dev)
+        self.aux_vol = torch.zeros(*self.res).to(torch.bool).to(self.dev)
         if self.fuse_color:
             self.rgb_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)
 
@@ -71,6 +73,9 @@ class TSDF(object):
         # all points 1. inside frustum 2. with valid depth 3. outside -truncate_dist
         dist = torch.clamp(depth_diff / self.sdf_trunc, max=1)
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
+        neg_pts = (depth_val > 0.) & (depth_diff < -self.sdf_trunc)
+        neg_vox_coords = valid_vox_coords[neg_pts]
+        self.aux_vol[neg_vox_coords.T[0], neg_vox_coords.T[1], neg_vox_coords.T[2]] = True
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
         assert dist_func in ['point2point', 'point2plane']
@@ -97,9 +102,17 @@ class TSDF(object):
         w_new = torch.clamp(w_new, max=20)
         self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
 
+    @property
+    def post_processed_vol(self):
+        sdf_vol = self.sdf_vol.clone()
+        in_obj_ids = torch.logical_and(self.w_vol == 0, self.aux_vol)
+        sdf_vol[in_obj_ids] = -1.0
+        return sdf_vol
+
     def reset(self):
         self.sdf_vol = torch.ones(*self.res).to(self.dt).to(self.dev)
         self.w_vol = torch.zeros(*self.res).to(self.dt).to(self.dev)
+        self.aux_vol = torch.zeros(*self.res).to(torch.bool).to(self.dev)
         if self.fuse_color:
             self.rgb_vol = torch.zeros(*self.res, 3).to(self.dt).to(self.dev)
 
@@ -108,9 +121,16 @@ class TSDF(object):
             data = torch.from_numpy(data)
         return data.to(self.dt).to(self.dev)
 
-    def marching_cubes(self, step_size=1):
+    def marching_cubes(self, step_size=1, use_post_processed=True, smooth=True):
         b = time.time()
-        verts, faces, norms, vals = measure.marching_cubes(self.sdf_vol.cpu().numpy(), step_size=step_size)
+        if use_post_processed:
+            sdf_vol = self.post_processed_vol
+        else:
+            sdf_vol = self.sdf_vol
+        if smooth:
+            sdf_vol = self.gaussian_smooth(sdf_vol)
+        sdf_vol = sdf_vol.cpu().numpy()
+        verts, faces, norms, vals = measure.marching_cubes(sdf_vol, step_size=step_size)
         norms = -norms
         verts_ids = np.round(verts).astype(int)
         verts = verts * self.vox_len.cpu().numpy() + self.origin.cpu().numpy().reshape(1, 3)
@@ -122,9 +142,15 @@ class TSDF(object):
         print('elapse time on marching cubes: {:04f}ms'.format((e - b)*1000))
         return verts, faces, norms, rgbs
 
-    def compute_pcl(self, threshold=0.2):
+    def compute_pcl(self, threshold=0.2, use_post_processed=True, smooth=True):
         b = time.time()
-        valid_vox = torch.abs(self.sdf_vol) < threshold
+        if use_post_processed:
+            sdf_vol = self.post_processed_vol
+        else:
+            sdf_vol = self.sdf_vol
+        if smooth:
+            sdf_vol = self.gaussian_smooth(sdf_vol)
+        valid_vox = torch.abs(sdf_vol) < threshold
         xyz = self.vox_coords[valid_vox] * self.vox_len + self.origin.reshape(1, 3)
         if self.fuse_color:
             rgb = self.rgb_vol[valid_vox]
@@ -205,6 +231,19 @@ class TSDF(object):
         else:
             n = torch.stack([a, b, -torch.ones_like(a, device=self.dev, dtype=self.dt)], dim=-1)
         return n
+
+    def gaussian_smooth(self, volume, kernel_size=3, sigma_square=0.7):
+        if len(volume.shape) != 5:
+            volume = torch.unsqueeze(torch.unsqueeze(volume, dim=0), dim=0)
+        h = kernel_size // 2
+        kernel_ids = torch.arange(kernel_size, device=self.dev, dtype=self.dt)
+        x, y, z = torch.meshgrid(kernel_ids, kernel_ids, kernel_ids, indexing='ij')
+        kernel = torch.exp(-((x - h) ** 2 + (y - h) ** 2 + (z - h) ** 2) / (2 * sigma_square))
+        kernel /= torch.sum(kernel)
+        kernel = torch.unsqueeze(torch.unsqueeze(kernel, dim=0), dim=0)
+        volume = conv3d(volume, weight=kernel, stride=1, padding=h)
+        volume = torch.squeeze(volume)
+        return volume
 
     @staticmethod
     def write_mesh(filename, vertices, faces, normals, rgbs):
@@ -323,6 +362,9 @@ class PSDF(TSDF):
         # all points 1. inside frustum 2. with valid depth 3. outside -truncate_dist
         dist = torch.clamp(depth_diff / self.sdf_trunc, max=1)
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
+        neg_pts = (depth_val > 0.) & (depth_diff < -self.sdf_trunc)
+        neg_vox_coords = valid_vox_coords[neg_pts]
+        self.aux_vol[neg_vox_coords.T[0], neg_vox_coords.T[1], neg_vox_coords.T[2]] = True
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
         assert dist_func in ['point2point', 'point2plane']
@@ -351,6 +393,13 @@ class PSDF(TSDF):
             rgb_new = (sigma2_old[:, None] * valid_rgb + sigma2[:, None] * rgb_old) / sigma2_sum[:, None]
             self.rgb_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2], :] = rgb_new
         self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = (sigma2_old * sigma2) / sigma2_sum
+
+    @property
+    def post_processed_vol(self):
+        sdf_vol = self.sdf_vol.clone()
+        in_obj_ids = torch.logical_and(self.w_vol == 10, self.aux_vol)
+        sdf_vol[in_obj_ids] = -1.0
+        return sdf_vol
 
 
 class GradientSDF(TSDF):
@@ -394,6 +443,9 @@ class GradientSDF(TSDF):
         # all points 1. inside frustum 2. with valid depth 3. outside -truncate_dist
         dist = torch.clamp(depth_diff / self.sdf_trunc, max=1)
         valid_pts = (depth_val > 0.) & (depth_diff >= -self.sdf_trunc)
+        neg_pts = (depth_val > 0.) & (depth_diff < -self.sdf_trunc)
+        neg_vox_coords = valid_vox_coords[neg_pts]
+        self.aux_vol[neg_vox_coords.T[0], neg_vox_coords.T[1], neg_vox_coords.T[2]] = True
         valid_vox_coords = valid_vox_coords[valid_pts]
         valid_dist = dist[valid_pts]
         assert dist_func in ['point2point', 'point2plane']
@@ -424,9 +476,15 @@ class GradientSDF(TSDF):
         # w_new = torch.clamp(w_new, max=20)
         self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
 
-    def compute_pcl(self, threshold=0.2):
+    def compute_pcl(self, threshold=0.2, use_post_processed=True, smooth=True):
         b = time.time()
-        valid_vox = torch.abs(self.sdf_vol) < threshold
+        if use_post_processed:
+            sdf_vol = self.post_processed_vol
+        else:
+            sdf_vol = self.sdf_vol
+        if smooth:
+            sdf_vol = self.gaussian_smooth(sdf_vol)
+        valid_vox = torch.abs(sdf_vol) < threshold
         xyz = self.vox_coords[valid_vox] * self.vox_len + self.origin.reshape(1, 3)
         if self.fuse_color:
             rgb = self.rgb_vol[valid_vox]

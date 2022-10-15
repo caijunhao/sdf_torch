@@ -50,10 +50,12 @@ project_matrix = p.computeProjectionMatrixFOV(fov, aspect_ratio, near, far)
 num_fusion = 20
 r = 0.5  # meter
 half_range = 0.2
+origin = np.array([-0.192, -0.192, 0.007])
 volume_bounds = np.array([[-half_range, half_range],
                           [-half_range, half_range],
                           [-half_range, half_range]])
-resolution = np.array([200, 200, 200])
+resolution = np.array([128, 128, 96])
+voxel_length = 0.003
 
 half_size = 0.05
 box1 = p.createMultiBody(0,
@@ -73,7 +75,7 @@ p.changeVisualShape(box2, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
 p.changeVisualShape(sphere, -1, rgbaColor=np.random.uniform(size=3).tolist()+[1])
 p.stepSimulation()
 
-sdf = GradientSDF(volume_bounds.T[0], resolution, 0.002, fuse_color=True)
+sdf = PSDF(origin, resolution, voxel_length, fuse_color=True)
 total = 0
 for i in range(num_fusion):
     t_c2w = random_sphere_sampling(r)
@@ -98,7 +100,7 @@ for i in range(num_fusion):
     # sdf.sdf_integrate(depth, intrinsic, t_c2w, rgb=color)
 print('fps: {}'.format(num_fusion / total))
 sdf.write_pcl('tsdf_cube_pcl.ply', *sdf.compute_pcl(threshold=0.2))
-sdf.write_mesh('tsdf_cube_mesh.ply', *sdf.marching_cubes())
+sdf.write_mesh('tsdf_cube_mesh.ply', *sdf.marching_cubes(smooth=False))
 
 
 
