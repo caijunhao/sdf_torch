@@ -1,5 +1,5 @@
 from skimage import measure
-from torch.nn.functional import conv3d, grid_sample
+from torch.nn.functional import conv2d, conv3d, grid_sample
 import numpy as np
 import torch
 import time
@@ -136,7 +136,7 @@ class TSDF(object):
         verts_ids = np.round(verts).astype(int)
         verts = verts * self.vox_len.cpu().numpy() + self.origin.cpu().numpy().reshape(1, 3)
         if self.fuse_color:
-            rgbs = self.rgb_vol[verts_ids[:, 0], verts_ids[:, 1], verts_ids[:, 2]].cpu().numpy().astype(np.uint8)
+            rgbs = self.rgb_vol.cpu().numpy()[verts_ids[:, 0], verts_ids[:, 1], verts_ids[:, 2]].astype(np.uint8)
         else:
             rgbs = np.ones_like(verts).astype(np.uint8) * 255
         e = time.time()
@@ -183,49 +183,39 @@ class TSDF(object):
         pcl = depth.unsqueeze(dim=-1) * (pixel_coords @ inv_intrinsic.T)  # ordered point cloud map
         return pcl
 
-    def normal_estimation(self, depth, intrinsic, kernel=5, normalized=True):
+    def normal_estimation(self, depth, intrinsic, kernel_size=5, normalized=True):
         """
         Estimate surface normals in camera frame given the depth map and the intrinsic matrix of the camera.
         We estimate the surface normal by approximating the surface z = f(x, y) as a linear function of x and y.
         For more details, please refer to "A Fast Method For Computing Principal Curvatures From Range Images".
         :param depth: (torch.Tensor) [H, W] the depth map.
         :param intrinsic: (torch.Tensor) [3, 3] the intrinsic matrix of the camera.
-        :param kernel: (int) the size of the kernel that containing the pixels used to estimate surface normal.
+        :param kernel_size: (int) the size of the kernel that containing the pixels used to estimate surface normal.
         :param normalized: (bool) whether normalize the surface normal or not.
         :return: (torch.Tensor) [H, W, 3] the surface normal map in camera frame.
         """
-        assert kernel % 2 == 1  # make sure the patch_size is odd.
-        pixel_coords = self.depth2cloud(depth, intrinsic)
-        # duplicate coordinates according to the offsets
-        h, w = pixel_coords.shape[0:2]
-        shift_ids = torch.cat(
-            [ids.reshape(-1, 1) for ids in torch.meshgrid(torch.arange(kernel), torch.arange(kernel), indexing='ij')],
-            dim=1) - kernel // 2
-        num_shift = shift_ids.shape[0]
-        pixel_pos_combined = torch.zeros_like(pixel_coords, dtype=self.dt, device=self.dev)
-        pixel_pos_combined = torch.stack([pixel_pos_combined] * num_shift, dim=2)
-        num_valid = torch.zeros((h, w), dtype=self.dt, device=self.dev)  # # of non-zero pixels in a kernel
-        for i in range(num_shift):
-            h0c, w0c = max(0, 0 + shift_ids[i][0]), max(0, 0 + shift_ids[i][1])
-            h1c, w1c = min(h, h + shift_ids[i][0]), min(w, w + shift_ids[i][1])
-            h0a, w0a = max(0, 0 - shift_ids[i][0]), max(0, 0 - shift_ids[i][1])
-            h1a, w1a = min(h, h - shift_ids[i][0]), min(w, w - shift_ids[i][1])
-            pixel_pos_combined[h0c:h1c, w0c:w1c, i] = pixel_coords[h0a:h1a, w0a:w1a]
-            num_valid[h0c:h1c, w0c:w1c] += 1
-        zero_flag = pixel_pos_combined[..., 0] == 0  # # H x W x num_shift
-        num_valid = num_valid.unsqueeze(dim=-1).unsqueeze(dim=-1)  # H x W x 1 x 1
-        mean = torch.sum(pixel_pos_combined / num_valid, dim=2, keepdim=True)  # H x W x 1 x 3
-        pixel_pos_combined[zero_flag] = (torch.ones_like(pixel_pos_combined, device=self.dev, dtype=self.dt) * mean)[zero_flag]
-        pos_cen = pixel_pos_combined - mean
-        x_cen, y_cen, z_cen = pos_cen.unbind(dim=-1)
-        m00 = torch.sum(x_cen * x_cen, dim=-1)
-        m01 = torch.sum(x_cen * y_cen, dim=-1)
+        one_hot_w = [k.reshape(kernel_size, kernel_size) for k in torch.eye(kernel_size*kernel_size).unbind(dim=-1)]
+        one_hot_w = torch.stack(one_hot_w, dim=0).unsqueeze(dim=1).to(self.dt).to(self.dev)  # ks*ks x 1 x ks x ks
+        w1 = torch.ones((1, 1, kernel_size, kernel_size), device=self.dev, dtype=self.dt)
+        pixel_coords = self.depth2cloud(depth, intrinsic).permute(2, 0, 1).unsqueeze(dim=0)
+        num_valid = conv2d((depth.unsqueeze(dim=0).unsqueeze(dim=0) > 0).to(self.dt), w1, padding='same')
+        pixel_coords_sum = [conv2d(coords, w1, padding='same') for coords in pixel_coords.unsqueeze(dim=0).unbind(dim=2)]
+        pixel_coords_sum = torch.cat(pixel_coords_sum, dim=1)
+        mean = pixel_coords_sum / num_valid  # 1 x 3 x H x W
+        xyz = [conv2d(coords, one_hot_w, padding='same') for coords in pixel_coords.unsqueeze(dim=0).unbind(dim=2)]
+        xyz = torch.stack(xyz, dim=2).squeeze(dim=0)  # ks^2 x 3 x H x W
+        x_cen, y_cen, z_cen = (xyz - mean).unbind(dim=1)  # ks^2 x H x W
+        m00 = torch.sum(x_cen * x_cen, dim=0)
+        m01 = torch.sum(x_cen * y_cen, dim=0)
         m10 = m01
-        m11 = torch.sum(y_cen * y_cen, dim=-1)
-        v0 = torch.sum(x_cen * z_cen, dim=-1)
-        v1 = torch.sum(y_cen * z_cen, dim=-1)
+        m11 = torch.sum(y_cen * y_cen, dim=0)
+        v0 = torch.sum(x_cen * z_cen, dim=0)
+        v1 = torch.sum(y_cen * z_cen, dim=0)
         det = m00 * m11 - m01 * m10
         a, b = (m11 * v0 - m01 * v1) / det, (-m10 * v0 + m00 * v1) / det
+        # todo: not sure if they are valid ops
+        a[torch.isnan(a)], b[torch.isnan(b)] = 0, 0
+        a[torch.isinf(a)], b[torch.isinf(b)] = 1000, 1000
         if normalized:
             norm = torch.sqrt(1 + a * a + b * b)
             n = torch.stack([a / norm, b / norm, -1 / norm], dim=-1)
@@ -421,7 +411,7 @@ class PSDF(TSDF):
         n = n[pix_y[valid_pix], pix_x[valid_pix]]
         valid_n = n[valid_pts]
         valid_cos_theta = torch.acos(torch.abs(valid_n[:, 2]))
-        sigma = 0.0012 + 0.0019 * (valid_depth_val - 0.4) ** 2 + 0.0001 / torch.sqrt(valid_depth_val) * valid_cos_theta ** 2 / (torch.pi / 2 - valid_cos_theta) ** 2
+        sigma = 0.0012 + 0.0019 * (valid_depth_val - 0.4) ** 2 + 0.0001 / torch.sqrt(valid_depth_val) * valid_cos_theta ** 2 / ((torch.pi / 2 - valid_cos_theta) ** 2 + 1e-7)
         sigma2 = (sigma / self.sdf_trunc) ** 2  # + (torch.exp(0.3 * torch.abs(valid_dist)) - 1)
         sigma2_old = self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
         sdf_old = self.sdf_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]]
