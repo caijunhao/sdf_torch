@@ -104,6 +104,10 @@ class TSDF(object):
         self.w_vol[valid_vox_coords.T[0], valid_vox_coords.T[1], valid_vox_coords.T[2]] = w_new
 
     @property
+    def shape(self):
+        return self.sdf_vol.shape
+
+    @property
     def post_processed_vol(self):
         sdf_vol = self.sdf_vol.clone()
         in_obj_ids = torch.logical_and(self.w_vol == 0, self.aux_vol)
